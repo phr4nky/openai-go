@@ -387,8 +387,9 @@ func TestAccumulatorMetadataUsesProjectedRetainedState(t *testing.T) {
 			chunk: func() openai.ChatCompletionChunk {
 				return accumulatorStringChunk(openai.ChatCompletionChunkChoiceDelta{})
 			},
-			setChunk: func(chunk *openai.ChatCompletionChunk, value string) { chunk.Choices[0].FinishReason = value },
-			get:      func(acc *openai.ChatCompletionAccumulator) string { return acc.Choices[0].FinishReason },
+			setChunk:         func(chunk *openai.ChatCompletionChunk, value string) { chunk.Choices[0].FinishReason = value },
+			get:              func(acc *openai.ChatCompletionAccumulator) string { return acc.Choices[0].FinishReason },
+			clearAccumulator: func(acc *openai.ChatCompletionAccumulator) { acc.Choices[0].FinishReason = "" },
 		},
 		{
 			name: "role",
