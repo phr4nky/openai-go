@@ -110,9 +110,11 @@ type chatCompletionToolProjectionTable struct {
 }
 
 type chatCompletionTextAppendProjection struct {
-	content [2]uint64
-	refusal [2]uint64
-	tools   chatCompletionToolProjectionTable
+	content         [2]uint64
+	refusal         [2]uint64
+	audioTranscript [2]uint64
+	audioData       [2]uint64
+	tools           chatCompletionToolProjectionTable
 }
 
 const (
@@ -134,6 +136,12 @@ func (projection *chatCompletionTextAppendProjection) addChunk(chunk *ChatComple
 		}
 		if choice.Delta.Refusal != "" {
 			markChatCompletionTextAppend(&projection.refusal, choiceIndex)
+		}
+		if choice.Delta.Audio.Transcript != "" {
+			markChatCompletionTextAppend(&projection.audioTranscript, choiceIndex)
+		}
+		if choice.Delta.Audio.Data != "" {
+			markChatCompletionTextAppend(&projection.audioData, choiceIndex)
 		}
 		for j := range choice.Delta.ToolCalls {
 			tool := &choice.Delta.ToolCalls[j]
@@ -169,6 +177,14 @@ func (projection *chatCompletionTextAppendProjection) choiceContent(index int) b
 
 func (projection *chatCompletionTextAppendProjection) choiceRefusal(index int) bool {
 	return chatCompletionTextAppendMarked(&projection.refusal, index)
+}
+
+func (projection *chatCompletionTextAppendProjection) choiceAudioTranscript(index int) bool {
+	return chatCompletionTextAppendMarked(&projection.audioTranscript, index)
+}
+
+func (projection *chatCompletionTextAppendProjection) choiceAudioData(index int) bool {
+	return chatCompletionTextAppendMarked(&projection.audioData, index)
 }
 
 func (projection *chatCompletionTextAppendProjection) toolName(choiceIndex int, toolIndex int) bool {
@@ -224,16 +240,21 @@ func (acc *ChatCompletionAccumulator) chatCompletionMetadataWithinLimit(chunk *C
 
 	var finishReasonSeen [2]uint64
 	var roleSeen [2]uint64
+	var audioIDSeen [2]uint64
 	for i := len(chunk.Choices) - 1; i >= 0; i-- {
 		choiceDelta := &chunk.Choices[i]
 		choiceIndex := int(choiceDelta.Index)
-		var currentFinishReasonBytes, currentRoleBytes int
+		var currentFinishReasonBytes, currentRoleBytes, currentAudioIDBytes int
 		if choiceIndex < len(completion.Choices) {
 			choice := &completion.Choices[choiceIndex]
 			currentFinishReasonBytes = len(choice.FinishReason)
 			currentRoleBytes = len(choice.Message.Role)
+			currentAudioIDBytes = len(choice.Message.Audio.ID)
 		}
-		if markChatCompletionMetadataProjected(&finishReasonSeen, choiceIndex) {
+		if choiceDelta.Delta.Audio.ID != "" && markChatCompletionMetadataProjected(&audioIDSeen, choiceIndex) {
+			delta += int64(len(choiceDelta.Delta.Audio.ID) - currentAudioIDBytes)
+		}
+		if choiceDelta.FinishReason != "" && markChatCompletionMetadataProjected(&finishReasonSeen, choiceIndex) {
 			deltaBytes := len(choiceDelta.FinishReason) - currentFinishReasonBytes
 			delta += int64(deltaBytes)
 		}
@@ -267,6 +288,7 @@ func (acc *ChatCompletionAccumulator) addChatCompletionChunkMetadataWork(work *i
 	}
 	var finishReasonSeen [2]uint64
 	var roleSeen [2]uint64
+	var audioIDSeen [2]uint64
 	for i := range chunk.Choices {
 		delta := &chunk.Choices[i]
 		choiceIndex := int(delta.Index)
@@ -274,13 +296,24 @@ func (acc *ChatCompletionAccumulator) addChatCompletionChunkMetadataWork(work *i
 		if choiceIndex < len(acc.stringState.choices) {
 			choiceState = acc.stringState.choices[choiceIndex]
 		}
-		finishReason, role := "", ""
+		finishReason, role, audioID := "", "", ""
 		hasPublicChoice := choiceState != nil && choiceIndex < len(completion.Choices)
 		if hasPublicChoice {
 			finishReason = choiceState.finishReason
 			role = choiceState.role
+			audioID = choiceState.audioID
 			choice := &completion.Choices[choiceIndex]
-			if !addAccumulatorMetadataAssignmentAfterPublicReconciliation(
+			if delta.Delta.Audio.ID != "" && !addAccumulatorMetadataAssignmentAfterPublicReconciliation(
+				work,
+				delta.Delta.Audio.ID,
+				choice.Message.Audio.ID,
+				audioID,
+				&audioIDSeen,
+				choiceIndex,
+			) {
+				return false
+			}
+			if delta.FinishReason != "" && !addAccumulatorMetadataAssignmentAfterPublicReconciliation(
 				work,
 				delta.FinishReason,
 				choice.FinishReason,
@@ -301,8 +334,12 @@ func (acc *ChatCompletionAccumulator) addChatCompletionChunkMetadataWork(work *i
 				return false
 			}
 		}
-		if !hasPublicChoice &&
+		if !hasPublicChoice && delta.FinishReason != "" &&
 			!addAccumulatorMetadataAssignmentWork(work, delta.FinishReason, finishReason, &finishReasonSeen, choiceIndex) {
+			return false
+		}
+		if !hasPublicChoice && delta.Delta.Audio.ID != "" &&
+			!addAccumulatorMetadataAssignmentWork(work, delta.Delta.Audio.ID, audioID, &audioIDSeen, choiceIndex) {
 			return false
 		}
 		if !hasPublicChoice && delta.Delta.Role != "" &&
