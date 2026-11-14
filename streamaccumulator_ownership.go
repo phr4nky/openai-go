@@ -94,6 +94,8 @@ func (state chatCompletionAccumulatorStringState) cloneForAccumulatorCopy() chat
 		choiceCopy := *choice
 		choiceCopy.content.shared = len(choiceCopy.content.buffer) > 0
 		choiceCopy.refusal.shared = len(choiceCopy.refusal.buffer) > 0
+		choiceCopy.audioTranscript.shared = len(choiceCopy.audioTranscript.buffer) > 0
+		choiceCopy.audioData.shared = len(choiceCopy.audioData.buffer) > 0
 		choiceCopy.toolCalls = cloneAccumulatorSlice(choiceCopy.toolCalls)
 		choiceCopy.activeToolCalls = cloneAccumulatorSlice(choiceCopy.activeToolCalls)
 		choiceCopy.toolOwners, choiceCopy.toolOwnerDepth = nil, 0
@@ -136,7 +138,7 @@ func (acc *ChatCompletionAccumulator) privateStateCopyWork() int {
 
 func (acc *ChatCompletionAccumulator) addCopiedTextBufferWork(work *int, chunk *ChatCompletionChunk) bool {
 	copied := acc.privateStateNeedsDetach()
-	var chargedContent, chargedRefusal [2]uint64
+	var chargedContent, chargedRefusal, chargedTranscript, chargedAudioData [2]uint64
 	var chargedTools *chatCompletionTextAppendProjection
 	for i := range chunk.Choices {
 		delta := &chunk.Choices[i]
@@ -152,7 +154,11 @@ func (acc *ChatCompletionAccumulator) addCopiedTextBufferWork(work *int, chunk *
 		if !addCopiedChoiceTextBufferWork(work, &chargedContent, choiceIndex, &choiceState.content,
 			message.Content, delta.Delta.Content, copied) ||
 			!addCopiedChoiceTextBufferWork(work, &chargedRefusal, choiceIndex, &choiceState.refusal,
-				message.Refusal, delta.Delta.Refusal, copied) {
+				message.Refusal, delta.Delta.Refusal, copied) ||
+			!addCopiedChoiceTextBufferWork(work, &chargedTranscript, choiceIndex, &choiceState.audioTranscript,
+				message.Audio.Transcript, delta.Delta.Audio.Transcript, copied) ||
+			!addCopiedChoiceTextBufferWork(work, &chargedAudioData, choiceIndex, &choiceState.audioData,
+				message.Audio.Data, delta.Delta.Audio.Data, copied) {
 			return false
 		}
 		for j := range delta.Delta.ToolCalls {

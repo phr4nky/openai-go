@@ -77,6 +77,9 @@ type chatCompletionChoiceStringState struct {
 	reconcileCursor int
 	finishReason    string
 	role            string
+	audioTranscript chatCompletionString
+	audioData       chatCompletionString
+	audioID         string
 }
 
 type chatCompletionToolCallStringState struct {
@@ -119,8 +122,9 @@ const maxStreamAccumulatorToolCallGrowth = 128
 // Returns false if the chunk could not be successfully accumulated. To bound work and
 // memory for untrusted streams, an accumulator accepts choice indices from 0 through
 // 127 and bounds sparse tool-call growth both per index and across a chunk.
-// Accumulated chunks, dense tool calls, content, refusal, tool-function text,
-// metadata, and log probabilities retain their existing unlimited-size contract;
+// Accumulated chunks, dense tool calls, content, refusal, audio transcript and
+// data, tool-function text, metadata, and log probabilities retain their
+// existing unlimited-size contract;
 // text and logprob buffers grow geometrically with checked representable-int
 // accounting.
 // A tool-call index may grow its choice by at most 128 positions; dense sequences
@@ -418,13 +422,20 @@ func (acc *ChatCompletionAccumulator) accumulateDelta(chunk *ChatCompletionChunk
 		choiceStrings := acc.stringState.choice(choiceIndex)
 		if accumulatorStringWillGrow(&choiceStrings.content, delta.Delta.Content) ||
 			accumulatorStringWillGrow(&choiceStrings.refusal, delta.Delta.Refusal) ||
+			accumulatorStringWillGrow(&choiceStrings.audioTranscript, delta.Delta.Audio.Transcript) ||
+			accumulatorStringWillGrow(&choiceStrings.audioData, delta.Delta.Audio.Data) ||
 			accumulatorMetadataWillChange(choiceStrings.finishReason, delta.FinishReason) ||
-			accumulatorMetadataWillChange(choiceStrings.role, delta.Delta.Role) {
+			accumulatorMetadataWillChange(choiceStrings.role, delta.Delta.Role) ||
+			accumulatorMetadataWillChange(choiceStrings.audioID, delta.Delta.Audio.ID) {
 			choiceStrings = acc.stringState.detachChoiceState(choiceIndex)
 		}
 
 		choice.Index = delta.Index
-		assignAccumulatorString(&choiceStrings.finishReason, &choice.FinishReason, delta.FinishReason)
+		// A chunk without a finish reason, such as the final audio update that
+		// only carries delta.audio.expires_at, must not clear an earlier one.
+		if delta.FinishReason != "" {
+			assignAccumulatorString(&choiceStrings.finishReason, &choice.FinishReason, delta.FinishReason)
+		}
 
 		if delta.Delta.Role != "" {
 			assignAccumulatorString(&choiceStrings.role, &choice.Message.Role, constant.Assistant(delta.Delta.Role))
@@ -432,6 +443,15 @@ func (acc *ChatCompletionAccumulator) accumulateDelta(chunk *ChatCompletionChunk
 
 		choiceStrings.content.append(&choice.Message.Content, delta.Delta.Content)
 		choiceStrings.refusal.append(&choice.Message.Refusal, delta.Delta.Refusal)
+
+		if delta.Delta.Audio.ID != "" {
+			assignAccumulatorString(&choiceStrings.audioID, &choice.Message.Audio.ID, delta.Delta.Audio.ID)
+		}
+		if delta.Delta.Audio.ExpiresAt != 0 {
+			choice.Message.Audio.ExpiresAt = delta.Delta.Audio.ExpiresAt
+		}
+		choiceStrings.audioTranscript.append(&choice.Message.Audio.Transcript, delta.Delta.Audio.Transcript)
+		choiceStrings.audioData.append(&choice.Message.Audio.Data, delta.Delta.Audio.Data)
 
 		toolCallCount := len(choice.Message.ToolCalls)
 		for _, deltaTool := range delta.Delta.ToolCalls {
@@ -481,9 +501,13 @@ func (acc *ChatCompletionAccumulator) accumulateDelta(chunk *ChatCompletionChunk
 	cc.Usage.CompletionTokensDetails.AudioTokens += chunk.Usage.CompletionTokensDetails.AudioTokens
 	cc.Usage.CompletionTokensDetails.ReasoningTokens += chunk.Usage.CompletionTokensDetails.ReasoningTokens
 	cc.Usage.CompletionTokensDetails.RejectedPredictionTokens += chunk.Usage.CompletionTokensDetails.RejectedPredictionTokens
+	cc.Usage.CompletionTokensDetails.TextTokens += chunk.Usage.CompletionTokensDetails.TextTokens
 
 	cc.Usage.PromptTokensDetails.AudioTokens += chunk.Usage.PromptTokensDetails.AudioTokens
+	cc.Usage.PromptTokensDetails.CacheWriteTokens += chunk.Usage.PromptTokensDetails.CacheWriteTokens
 	cc.Usage.PromptTokensDetails.CachedTokens += chunk.Usage.PromptTokensDetails.CachedTokens
+	cc.Usage.PromptTokensDetails.ImageTokens += chunk.Usage.PromptTokensDetails.ImageTokens
+	cc.Usage.PromptTokensDetails.TextTokens += chunk.Usage.PromptTokensDetails.TextTokens
 
 	assignAccumulatorString(&acc.stringState.model, &cc.Model, chunk.Model)
 	cc.Created = chunk.Created
@@ -606,15 +630,21 @@ func (acc *ChatCompletionAccumulator) reconcilePublicState(chunk *ChatCompletion
 		}
 		if accumulatorStringNeedsReconciliationDetach(&choiceState.content, message.Content) ||
 			accumulatorStringNeedsReconciliationDetach(&choiceState.refusal, message.Refusal) ||
+			accumulatorStringNeedsReconciliationDetach(&choiceState.audioTranscript, message.Audio.Transcript) ||
+			accumulatorStringNeedsReconciliationDetach(&choiceState.audioData, message.Audio.Data) ||
 			accumulatorMetadataNeedsReconciliationDetach(choiceState.finishReason, completion.Choices[i].FinishReason) ||
-			accumulatorMetadataNeedsReconciliationDetach(choiceState.role, message.Role) {
+			accumulatorMetadataNeedsReconciliationDetach(choiceState.role, message.Role) ||
+			accumulatorMetadataNeedsReconciliationDetach(choiceState.audioID, message.Audio.ID) {
 			choiceState = stringState.detachChoiceState(i)
 			choicesDetached = true
 		}
 		choiceState.content.reconcile(&message.Content)
 		choiceState.refusal.reconcile(&message.Refusal)
+		choiceState.audioTranscript.reconcile(&message.Audio.Transcript)
+		choiceState.audioData.reconcile(&message.Audio.Data)
 		reconcileAccumulatorString(&choiceState.finishReason, &completion.Choices[i].FinishReason)
 		reconcileAccumulatorString(&choiceState.role, &message.Role)
+		reconcileAccumulatorString(&choiceState.audioID, &message.Audio.ID)
 
 		if toolCallsTruncated {
 			invalidateRemovedToolCallState(&acc.legacyChoiceChatCompletionStates, i, len(message.ToolCalls))
@@ -797,16 +827,25 @@ func (acc *ChatCompletionAccumulator) addChatCompletionTextBytes(total int, work
 		message := &completion.Choices[i].Message
 		choiceState := acc.stringState.choices[i]
 		contentAppend, refusalAppend := false, false
+		transcriptAppend, audioDataAppend := false, false
 		if !accumulatorStringUsesPublishedBacking(message.Content, choiceState.content.published) ||
-			!accumulatorStringUsesPublishedBacking(message.Refusal, choiceState.refusal.published) {
+			!accumulatorStringUsesPublishedBacking(message.Refusal, choiceState.refusal.published) ||
+			!accumulatorStringUsesPublishedBacking(message.Audio.Transcript, choiceState.audioTranscript.published) ||
+			!accumulatorStringUsesPublishedBacking(message.Audio.Data, choiceState.audioData.published) {
 			appends = ensureChatCompletionTextAppendProjection(appends, chunk)
 			contentAppend = appends.choiceContent(i)
 			refusalAppend = appends.choiceRefusal(i)
+			transcriptAppend = appends.choiceAudioTranscript(i)
+			audioDataAppend = appends.choiceAudioData(i)
 		}
 		if !addAccumulatorTextBytes(&total, message.Content) ||
 			!addAccumulatorTextBytes(&total, message.Refusal) ||
+			!addAccumulatorTextBytes(&total, message.Audio.Transcript) ||
+			!addAccumulatorTextBytes(&total, message.Audio.Data) ||
 			!addAccumulatorBufferReconciliationWork(work, message.Content, &choiceState.content, contentAppend) ||
-			!addAccumulatorBufferReconciliationWork(work, message.Refusal, &choiceState.refusal, refusalAppend) {
+			!addAccumulatorBufferReconciliationWork(work, message.Refusal, &choiceState.refusal, refusalAppend) ||
+			!addAccumulatorBufferReconciliationWork(work, message.Audio.Transcript, &choiceState.audioTranscript, transcriptAppend) ||
+			!addAccumulatorBufferReconciliationWork(work, message.Audio.Data, &choiceState.audioData, audioDataAppend) {
 			return 0, false
 		}
 		if !choiceState.visitReconciledTools(i, message.ToolCalls, chunk, func(j int) bool {
@@ -855,7 +894,9 @@ func addChatCompletionChunkTextBytes(total int, chunk *ChatCompletionChunk) (int
 	for i := range chunk.Choices {
 		delta := &chunk.Choices[i].Delta
 		if !addAccumulatorTextBytes(&total, delta.Content) ||
-			!addAccumulatorTextBytes(&total, delta.Refusal) {
+			!addAccumulatorTextBytes(&total, delta.Refusal) ||
+			!addAccumulatorTextBytes(&total, delta.Audio.Transcript) ||
+			!addAccumulatorTextBytes(&total, delta.Audio.Data) {
 			return 0, false
 		}
 		for j := range delta.ToolCalls {
@@ -891,8 +932,10 @@ func (acc *ChatCompletionAccumulator) addChatCompletionMetadataBytes(total int, 
 		choiceState := acc.stringState.choices[i]
 		if !addAccumulatorMetadataBytes(&total, choice.FinishReason) ||
 			!addAccumulatorMetadataBytes(&total, string(choice.Message.Role)) ||
+			!addAccumulatorMetadataBytes(&total, choice.Message.Audio.ID) ||
 			!addAccumulatorStringReconciliationWork(work, choice.FinishReason, choiceState.finishReason) ||
-			!addAccumulatorStringReconciliationWork(work, choice.Message.Role, choiceState.role) {
+			!addAccumulatorStringReconciliationWork(work, choice.Message.Role, choiceState.role) ||
+			!addAccumulatorStringReconciliationWork(work, choice.Message.Audio.ID, choiceState.audioID) {
 			return 0, false
 		}
 		if !choiceState.visitReconciledTools(i, choice.Message.ToolCalls, chunk, func(j int) bool {
