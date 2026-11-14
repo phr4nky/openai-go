@@ -621,10 +621,15 @@ func (cfg *RequestConfig) Execute() (err error) {
 			cfg.Request.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(b)), nil }
 			cfg.Request.Body, _ = cfg.Request.GetBody()
 		case *bytes.Reader:
+			// Give every attempt its own reader over the remaining bytes, as
+			// http.NewRequest does. The transport may still be reading a previous
+			// attempt's body after it returned a retryable response, so attempts
+			// must not share, or rewind, the caller's reader.
 			cfg.Request.ContentLength = int64(body.Len())
+			snapshot := *body
 			cfg.Request.GetBody = func() (io.ReadCloser, error) {
-				_, seekErr := body.Seek(0, 0)
-				return io.NopCloser(body), seekErr
+				r := snapshot
+				return io.NopCloser(&r), nil
 			}
 			cfg.Request.Body, _ = cfg.Request.GetBody()
 		default:
