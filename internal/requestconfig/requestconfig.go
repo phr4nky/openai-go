@@ -724,7 +724,9 @@ func (cfg *RequestConfig) Execute() (err error) {
 			_ = res.Body.Close()
 		}
 
-		if waitErr := WaitForDelay(ctx, delay); waitErr != nil {
+		// The delay between attempts is not part of any attempt, so wait on the
+		// caller's context rather than the per-attempt RequestTimeout context.
+		if waitErr := WaitForDelay(cfg.Request.Context(), delay); waitErr != nil {
 			return waitErr
 		}
 	}
